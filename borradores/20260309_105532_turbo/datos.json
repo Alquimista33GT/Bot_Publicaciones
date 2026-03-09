@@ -1,0 +1,14 @@
+{
+  "producto": "Turbo",
+  "marca": "Mazda",
+  "linea": "BT50 Pro",
+  "anio": "2015 al 2020",
+  "precio": "4990",
+  "estado": "Nuevo",
+  "motor": "",
+  "medida": "estándar",
+  "perfil": "",
+  "publicado": false,
+  "created_at": "2026-03-09T10:55:32",
+  "folder": "20260309_105532_turbo"
+}

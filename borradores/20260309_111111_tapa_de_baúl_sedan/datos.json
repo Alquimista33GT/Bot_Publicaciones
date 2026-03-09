@@ -1,0 +1,14 @@
+{
+  "producto": "Tapa de Baúl sedan",
+  "marca": "Honda",
+  "linea": "Civic",
+  "anio": "2001 al 2005",
+  "precio": "400",
+  "estado": "Usado Original",
+  "motor": "D17",
+  "medida": "estándar",
+  "perfil": "",
+  "publicado": false,
+  "created_at": "2026-03-09T11:11:11",
+  "folder": "20260309_111111_tapa_de_baúl_sedan"
+}

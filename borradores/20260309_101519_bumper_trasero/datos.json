@@ -1,0 +1,14 @@
+{
+  "producto": "Bumper trasero",
+  "marca": "Toyota",
+  "linea": "Tacoma",
+  "anio": "1996 - 2004",
+  "precio": "1500",
+  "estado": "Usado Origina",
+  "motor": "",
+  "medida": "",
+  "perfil": "Norma Otero",
+  "publicado": true,
+  "created_at": "2026-03-09T10:15:19",
+  "folder": "20260309_101519_bumper_trasero"
+}

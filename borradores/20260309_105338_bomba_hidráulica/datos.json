@@ -1,0 +1,14 @@
+{
+  "producto": "Bomba Hidráulica",
+  "marca": "Hyundai",
+  "linea": "Santa Fe",
+  "anio": "2000 al 2006",
+  "precio": "1100",
+  "estado": "Nueva",
+  "motor": "2.7",
+  "medida": "estándar",
+  "perfil": "",
+  "publicado": false,
+  "created_at": "2026-03-09T10:53:38",
+  "folder": "20260309_105338_bomba_hidráulica"
+}

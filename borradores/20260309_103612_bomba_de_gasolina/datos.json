@@ -1,0 +1,14 @@
+{
+  "producto": "Bomba de Gasolina",
+  "marca": "Honda",
+  "linea": "Civic",
+  "anio": "2001 al 2005",
+  "precio": "350",
+  "estado": "Usado Original",
+  "motor": "D17",
+  "medida": "estándar",
+  "perfil": "",
+  "publicado": false,
+  "created_at": "2026-03-09T10:36:12",
+  "folder": "20260309_103612_bomba_de_gasolina"
+}

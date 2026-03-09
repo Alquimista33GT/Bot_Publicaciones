@@ -1,0 +1,14 @@
+{
+  "producto": "Ventilador de agua y de aire",
+  "marca": "Toyota",
+  "linea": "Rav4",
+  "anio": "2006 - 2011",
+  "precio": "1050",
+  "estado": "Nuevo",
+  "motor": "2.4",
+  "medida": "Estandar",
+  "perfil": "Dalita Otero",
+  "publicado": true,
+  "created_at": "2026-03-09T10:13:03",
+  "folder": "20260309_101303_ventilador_de_agua_y_de_aire"
+}

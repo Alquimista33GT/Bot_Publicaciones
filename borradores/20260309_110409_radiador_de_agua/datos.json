@@ -1,0 +1,14 @@
+{
+  "producto": "Radiador de Agua",
+  "marca": "Toyota",
+  "linea": "Rav4, Lexus, Camry",
+  "anio": "2019 - 2024",
+  "precio": "1300",
+  "estado": "Nuevo",
+  "motor": "2.5, 3.5",
+  "medida": "estándar",
+  "perfil": "",
+  "publicado": false,
+  "created_at": "2026-03-09T11:04:09",
+  "folder": "20260309_110409_radiador_de_agua"
+}

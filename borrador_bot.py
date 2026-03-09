@@ -2,12 +2,32 @@
 import os
 import re
 import json
-import sys
-import logging
-import datetime as dt
+import uuid
+import shutil
+import traceback
 from pathlib import Path
+from datetime import datetime
+
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+from ai_seo import generate_marketplace_seo
+
+
+# =========================================================
+# Configuración
+# =========================================================
+BASE_DIR = Path.home() / "cm_bot" / "borradores"
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 ENV_PATH = Path.home() / "cm_bot" / ".env"
+
 if ENV_PATH.exists():
     for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -16,506 +36,368 @@ if ENV_PATH.exists():
         k, v = line.split("=", 1)
         os.environ[k.strip()] = v.strip().strip('"').strip("'")
 
-sys.path.append(str(Path(__file__).parent))
 
-from PIL import Image
-from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, ContextTypes, filters
+TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 
-from ai_seo import generate_marketplace_seo
-
-logging.basicConfig(level=logging.INFO)
-TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
-
-BASE_DIR = Path.home() / "CM_Borradores"
-BASE_DIR.mkdir(parents=True, exist_ok=True)
-INDEX_FILE = BASE_DIR / "index.jsonl"
+if not TG_TOKEN:
+    raise RuntimeError("Falta TG_BOT_TOKEN en ~/.env o variables de entorno")
 
 
-# -------------------------
+# =========================================================
 # Utilidades
-# -------------------------
-def ensure_index_file():
-    if not INDEX_FILE.exists():
-        INDEX_FILE.write_text("", encoding="utf-8")
+# =========================================================
+def clean(txt: str) -> str:
+    txt = str(txt or "").strip()
+    txt = re.sub(r"\s+", " ", txt)
+    return txt
 
 
-def append_index(record: dict):
-    ensure_index_file()
-    with INDEX_FILE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def limpiar_texto(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-
-def slug(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"[^a-z0-9áéíóúñü\s-]", "", s)
-    s = s.replace(" ", "-")
-    s = re.sub(r"-+", "-", s).strip("-")
-    return s[:60] or "producto"
-
-
-def copiar_portapapeles(texto: str) -> bool:
+def safe_unlink(path: str | Path | None) -> None:
     try:
-        import subprocess
-        subprocess.run(["xclip", "-selection", "clipboard"], input=texto.encode("utf-8"), check=True)
-        return True
+        if path and Path(path).exists():
+            Path(path).unlink()
     except Exception:
-        return False
+        pass
 
 
-# -------------------------
-# Parser
-# -------------------------
+def now_ts() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def slugify(text: str, max_len: int = 50) -> str:
+    text = clean(text).lower()
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
+    text = re.sub(r"[-\s]+", "_", text).strip("_")
+    if not text:
+        text = "borrador"
+    return text[:max_len]
+
+
+def extract_numeric_price(value: str) -> str:
+    value = clean(value)
+    digits = re.sub(r"[^\d]", "", value)
+    return digits
+
+
+# =========================================================
+# Parseo de datos
+# =========================================================
 FIELD_ALIASES = {
-    "producto": {"producto", "prod", "pieza", "articulo", "artículo"},
-    "marca": {"marca"},
-    "linea": {"linea", "línea", "modelo"},
-    "anio": {"anio", "año", "year"},
-    "precio": {"precio", "valor", "costo", "coste", "q"},
-    "estado": {"estado", "condicion", "condición"},
-    "medida": {"medida", "detalle", "size", "rin", "rín"},
+    "producto": ["producto", "repuesto", "pieza", "nombre"],
+    "marca": ["marca"],
+    "linea": ["linea", "línea", "modelo"],
+    "anio": ["anio", "año", "años", "year"],
+    "precio": ["precio", "valor", "costo"],
+    "estado": ["estado", "condicion", "condición"],
+    "motor": ["motor", "cilindraje"],
+    "medida": ["medida", "detalle", "medidas", "observacion", "observación"],
 }
 
 
-def norm_key(k: str) -> str:
-    k = (k or "").strip().lower()
-    k = k.replace(":", "").replace(".", "")
-    k = k.replace("línea", "linea").replace("año", "anio").replace("condición", "condicion").replace("rín", "rin")
-    return k
+def resolve_field(key: str) -> str | None:
+    key = clean(key).lower()
+    key = key.replace("í", "i").replace("á", "a").replace("é", "e").replace("ó", "o").replace("ú", "u")
+
+    for field, aliases in FIELD_ALIASES.items():
+        for alias in aliases:
+            alias_n = (
+                alias.lower()
+                .replace("í", "i")
+                .replace("á", "a")
+                .replace("é", "e")
+                .replace("ó", "o")
+                .replace("ú", "u")
+            )
+            if alias_n == key or alias_n in key:
+                return field
+
+    return None
 
 
-def parse_key_value_lines(text: str) -> dict:
-    out = {}
-    lines = [x.strip() for x in (text or "").splitlines() if x.strip()]
+def parse_datos(texto: str) -> dict:
+    data: dict[str, str] = {}
+    lines = texto.splitlines()
 
-    for line in lines:
-        if ":" in line:
-            k, v = line.split(":", 1)
-            k = norm_key(k)
-            v = limpiar_texto(v)
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if ":" not in line:
+            continue
+
+        k, v = line.split(":", 1)
+        field = resolve_field(k)
+        value = clean(v)
+
+        if not field or not value:
+            continue
+
+        if field == "precio":
+            data[field] = extract_numeric_price(value) or value
         else:
-            parts = line.split(None, 1)
-            if len(parts) < 2:
-                continue
-            k, v = norm_key(parts[0]), limpiar_texto(parts[1])
+            data[field] = value
 
-        for field, aliases in FIELD_ALIASES.items():
-            if k in aliases:
-                out[field] = v
-                break
-    return out
+    return data
 
 
-def detect_precio_any(text: str) -> str:
-    t = (text or "").replace(",", "")
-    m = re.search(r"(?:Q\s*)?(\d{2,7})", t)
-    return m.group(1) if m else "-"
+def validate_data(data: dict) -> tuple[bool, list[str]]:
+    missing = []
+
+    for required in ["producto", "precio", "estado"]:
+        if not clean(data.get(required, "")):
+            missing.append(required)
+
+    return (len(missing) == 0, missing)
 
 
-def detect_estado_any(text: str) -> str:
-    t = (text or "").lower()
-    if "nuevo" in t:
-        return "Nuevo"
-    if "usado" in t or "usada" in t:
-        return "Usado"
-    if "seminuevo" in t or "semi nuevo" in t:
-        return "Seminuevo"
-    return "-"
+# =========================================================
+# Armado del texto final
+# =========================================================
+def build_text(data: dict, seo: dict) -> str:
+    titulo = clean(seo.get("titulo", ""))
+    intro = clean(seo.get("intro", ""))
+    desc = clean(seo.get("descripcion", ""))
+    keywords = seo.get("keywords", []) or []
+
+    marca = clean(data.get("marca", ""))
+    linea = clean(data.get("linea", ""))
+    anio = clean(data.get("anio", ""))
+    precio = clean(data.get("precio", ""))
+    estado = clean(data.get("estado", ""))
+    motor = clean(data.get("motor", ""))
+    medida = clean(data.get("medida", ""))
+
+    vehiculo = " ".join([x for x in [marca, linea, anio] if x]).strip()
+
+    out = []
+
+    if titulo:
+        out.append(titulo)
+
+    if intro:
+        out.append(intro)
+
+    out.append("✅ Datos del producto")
+    out.append(f"Producto: {clean(data.get('producto', ''))}")
+
+    if vehiculo:
+        out.append(f"Vehículo: {vehiculo}")
+
+    if motor:
+        out.append(f"Motor: {motor}")
+
+    if medida:
+        out.append(f"Detalle / medida: {medida}")
+
+    if precio:
+        out.append(f"Precio: Q{precio}")
+
+    if estado:
+        out.append(f"Estado: {estado}")
+
+    if desc:
+        out.append("")
+        out.append(desc)
+
+    if keywords:
+        out.append("")
+        out.append("Palabras clave:")
+        for kw in keywords:
+            kw = clean(kw)
+            if kw:
+                out.append(kw)
+
+    return "\n".join(out).strip() + "\n"
 
 
-def detect_anio_any(text: str) -> str:
-    t = (text or "").lower().replace("–", "-")
-    t = t.replace(" al ", "-").replace(" a ", "-")
-    m = re.search(r"(19\d{2}|20\d{2})\s*-\s*(19\d{2}|20\d{2})", t)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}"
-    m2 = re.search(r"(19\d{2}|20\d{2})", t)
-    return m2.group(1) if m2 else "-"
-
-
-def parse_pipe(text: str) -> dict | None:
-    if "|" not in (text or ""):
-        return None
-    parts = [limpiar_texto(p) for p in text.split("|")]
-    while len(parts) < 6:
-        parts.append("-")
-    producto, marca, linea, anio, precio, estado = parts[:6]
-    return {
-        "producto": producto,
-        "marca": marca,
-        "linea": linea,
-        "anio": anio,
-        "precio": re.sub(r"[^\d]", "", precio) or precio,
-        "estado": estado,
-        "medida": "-",
-    }
-
-
-def parse_free_text_blob(text: str) -> dict:
-    t = limpiar_texto(text)
-    return {
-        "producto": t,
-        "marca": "-",
-        "linea": "-",
-        "anio": detect_anio_any(t),
-        "precio": detect_precio_any(t),
-        "estado": detect_estado_any(t),
-        "medida": "-",
-    }
-
-
-def parse_any(text: str) -> dict | None:
-    if not text:
-        return None
-
-    d = parse_pipe(text)
-    if d:
-        return d
-
-    d = parse_key_value_lines(text)
-
-    if not d:
-        d = parse_free_text_blob(text)
-
-    d.setdefault("producto", "-")
-    d.setdefault("marca", "-")
-    d.setdefault("linea", "-")
-    d.setdefault("anio", detect_anio_any(text))
-    d.setdefault("precio", detect_precio_any(text))
-    d.setdefault("estado", detect_estado_any(text))
-    d.setdefault("medida", "-")
-
-    if d.get("precio"):
-        d["precio"] = re.sub(r"[^\d]", "", d["precio"]) or d["precio"]
-
-    return d
-
-
-def needs_more_data(data: dict | None) -> bool:
-    if not data:
-        return True
-    for k in ("producto", "precio", "estado"):
-        if not data.get(k) or data.get(k) == "-":
-            return True
-    return False
-
-
-# -------------------------
+# =========================================================
 # Guardado
-# -------------------------
-def make_folder(ts: str, data: dict | None) -> Path:
-    producto_slug = slug((data or {}).get("producto", "") if data else "producto")
-    folder = BASE_DIR / f"{ts}_{producto_slug}"
+# =========================================================
+def save_borrador(data: dict, seo: dict, foto_path: str | None) -> Path:
+    ts = now_ts()
+    folder_name = f"{ts}_{slugify(data.get('producto', 'borrador'))}"
+    folder = BASE_DIR / folder_name
     folder.mkdir(parents=True, exist_ok=True)
+
+    text = build_text(data, seo)
+    (folder / "borrador.txt").write_text(text, encoding="utf-8")
+
+    meta = {
+        "producto": clean(data.get("producto", "")),
+        "marca": clean(data.get("marca", "")),
+        "linea": clean(data.get("linea", "")),
+        "anio": clean(data.get("anio", "")),
+        "precio": clean(data.get("precio", "")),
+        "estado": clean(data.get("estado", "")),
+        "motor": clean(data.get("motor", "")),
+        "medida": clean(data.get("medida", "")),
+        "perfil": "",
+        "publicado": False,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "folder": folder.name,
+    }
+
+    (folder / "datos.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    if foto_path and Path(foto_path).exists():
+        destino = folder / "foto.jpg"
+        shutil.move(str(foto_path), str(destino))
+
     return folder
 
 
-def save_all(folder: Path, ts: str, data: dict, borrador: str):
-    (folder / "borrador.txt").write_text(borrador, encoding="utf-8")
-    (folder / "datos.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+# =========================================================
+# Mensajes al usuario
+# =========================================================
+START_TEXT = """
+Bot de borradores Crazy Motors.
 
-    record = {
-        "ts": ts,
-        "folder": str(folder),
-        "foto": str(folder / "foto.jpg"),
-        "thumb": str(folder / "thumb.jpg"),
-        "borrador": str(folder / "borrador.txt"),
-        "datos": data,
+Flujo:
+1. Enviá primero la foto del repuesto
+2. Luego mandá los datos en este formato:
+
+Producto: Ventilador de Radiador y AC
+Marca: Toyota
+Linea: Rav4
+Anio: 2006-2011
+Motor: 2.4
+Medida: 2 pines
+Precio: 850
+Estado: Usado
+
+Mínimo requerido:
+- Producto
+- Precio
+- Estado
+""".strip()
+
+
+def format_missing_fields(missing: list[str]) -> str:
+    names = {
+        "producto": "Producto",
+        "precio": "Precio",
+        "estado": "Estado",
     }
-    append_index(record)
+    return "\n".join(f"- {names.get(x, x)}" for x in missing)
 
 
-# -------------------------
-# SEO / Borrador
-# -------------------------
-def local_seo_fallback(data: dict) -> dict:
-    producto = data.get("producto", "-").lower()
-    marca = data.get("marca", "-").lower()
-    linea = data.get("linea", "-").lower()
-    anio = data.get("anio", "-")
-    estado = data.get("estado", "-").lower()
-
-    titulo = " ".join(
-        [
-            x for x in [
-                data.get("producto", "-"),
-                data.get("marca", "-"),
-                data.get("linea", "-"),
-                data.get("anio", "-"),
-            ]
-            if x and x != "-"
-        ]
-    ).strip() or "Publicación"
-
-    intro = f"{data.get('producto', '-')} para {data.get('marca', '-')} {data.get('linea', '-')} {data.get('anio', '-')} disponible.".strip()
-
-    descripcion = (
-        f"{data.get('producto', '-')} en estado {estado} disponible para entrega. "
-        f"Envíos a Guatemala. Paga al recibir según cobertura."
-    )
-
-    keywords = [
-        f"{producto} {marca} {linea}".strip(),
-        f"{producto} {linea} {anio}".strip(),
-        f"{producto} usado original".strip(),
-        f"repuestos {marca} guatemala".strip(),
-        f"repuestos {linea} guatemala".strip(),
-        f"pieza {producto} {marca}".strip(),
-        f"{producto} para carro".strip(),
-        f"autopartes {marca} guatemala".strip(),
-        f"repuesto automotriz {linea}".strip(),
-        f"{producto} {anio} guatemala".strip(),
-        f"{producto} {marca} usado".strip(),
-        f"parachoques {linea} {anio}".strip() if "bumper" in producto else f"{producto} {marca} repuesto".strip(),
-    ]
-
-    seen = set()
-    clean = []
-    for k in keywords:
-        k = limpiar_texto(k)
-        if not k:
-            continue
-        if len(k.split()) < 2:
-            continue
-        if k in seen:
-            continue
-        seen.add(k)
-        clean.append(k)
-
-    return {
-        "titulo": titulo,
-        "intro": intro,
-        "descripcion": descripcion,
-        "keywords": clean[:16],
-    }
+# =========================================================
+# Handlers
+# =========================================================
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.setdefault("foto", None)
+    await update.message.reply_text(START_TEXT)
 
 
-def keywords_to_lines(keywords: list[str]) -> str:
-    """
-    Mantiene frases completas.
-    Si llegan palabras sueltas, las agrupa en frases de 2 a 4 palabras.
-    """
-    normalized = []
-    for kw in (keywords or []):
-        s = (kw or "").strip()
-        s = s.replace("#", "")
-        s = s.replace("•", " ").replace("—", " ").replace("|", " ")
-        s = re.sub(r"\s+", " ", s).strip()
-        if s:
-            normalized.append(s)
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.photo:
+        return
 
-    clean = []
-    seen = set()
-    i = 0
-
-    while i < len(normalized):
-        s = normalized[i]
-
-        if len(s.split()) >= 2:
-            phrase = s
-            i += 1
-        else:
-            chunk = [s]
-            j = i + 1
-            while j < len(normalized) and len(chunk) < 4 and len(normalized[j].split()) == 1:
-                chunk.append(normalized[j])
-                j += 1
-            phrase = " ".join(chunk)
-            i = j
-
-        phrase = limpiar_texto(phrase)
-
-        if len(phrase.split()) < 2:
-            continue
-
-        key = phrase.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        clean.append(phrase)
-
-        if len(clean) >= 16:
-            break
-
-    return "\n".join(clean)
-
-
-def build_borrador_final(data: dict) -> str:
     try:
-        seo = generate_marketplace_seo(data)
-    except Exception as e:
-        print("AI FALLÓ, uso fallback local:", e)
-        seo = local_seo_fallback(data)
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
 
-    titulo = limpiar_texto(seo.get("titulo", "Publicación"))
-    intro = limpiar_texto(seo.get("intro", ""))
-    descripcion = (seo.get("descripcion", "") or "").strip()
+        tmp = BASE_DIR / f"tmp_{uuid.uuid4().hex}.jpg"
+        await file.download_to_drive(tmp)
 
-    raw_keywords = seo.get("keywords", []) or []
-    raw_keywords = [re.sub(r"#", "", (k or "")) for k in raw_keywords]
-    keywords_block = keywords_to_lines(raw_keywords)
+        # borrar foto anterior temporal si existía
+        old_tmp = context.user_data.get("foto")
+        if old_tmp and old_tmp != str(tmp):
+            safe_unlink(old_tmp)
 
-    producto = data.get("producto", "-")
-    marca = data.get("marca", "-")
-    linea = data.get("linea", "-")
-    anio = data.get("anio", "-")
-    precio = data.get("precio", "-")
-    estado = data.get("estado", "-")
+        context.user_data["foto"] = str(tmp)
 
-    return f"""{titulo}
-
-{intro}
-
-✅ Producto: {producto}
-🚗 Vehículo: {marca} {linea} {anio}
-💰 Precio: Q{precio}
-📦 Estado: {estado}
-
-{descripcion}
-
-Palabras clave:
-{keywords_block}
-""".strip() + "\n"
-
-
-# -------------------------
-# Lógica principal
-# -------------------------
-async def build_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE, folder: Path, ts: str, text_data: str):
-    data = parse_any(text_data)
-    print("PARSED:", data)
-
-    if needs_more_data(data):
         await update.message.reply_text(
-            "Me faltan datos mínimos.\n"
-            "Necesito al menos: Producto + Precio + Estado."
+            "✅ Foto guardada.\n\nAhora enviame los datos del repuesto.\n\n"
+            "Formato sugerido:\n"
+            "Producto: ...\n"
+            "Marca: ...\n"
+            "Linea: ...\n"
+            "Anio: ...\n"
+            "Motor: ...\n"
+            "Medida: ...\n"
+            "Precio: ...\n"
+            "Estado: ..."
+        )
+
+    except Exception:
+        traceback.print_exc()
+        await update.message.reply_text("⚠️ No pude guardar la foto. Intentá nuevamente.")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text.strip()
+
+    # ignorar comandos
+    if text.startswith("/"):
+        return
+
+    data = parse_datos(text)
+    valid, missing = validate_data(data)
+
+    if not valid:
+        await update.message.reply_text(
+            "❌ Datos insuficientes.\n\nNecesito mínimo:\n"
+            f"{format_missing_fields(missing)}"
         )
         return
 
-    borrador = build_borrador_final(data)
-    save_all(folder, ts, data, borrador)
-    copiado = copiar_portapapeles(borrador)
+    foto = context.user_data.get("foto")
 
-    context.user_data.pop("pending_folder", None)
-    context.user_data.pop("pending_ts", None)
-    context.user_data.pop("pending_text", None)
-
-    await update.message.reply_text(
-        "✅ Publicación lista.\n"
-        f"📁 {folder}\n"
-        + ("📋 Copiado al portapapeles." if copiado else "ℹ️ Guardado en borrador.txt.")
-    )
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✅ Bot activo.\n\n"
-        "Podés usarlo de 3 formas:\n"
-        "1) Foto primero y luego datos\n"
-        "2) Datos primero y luego foto\n"
-        "3) Foto con caption\n\n"
-        "Ejemplo:\n"
-        "Producto: Bumper trasero\n"
-        "Marca: Toyota\n"
-        "Linea: Tacoma\n"
-        "Año: 1996-2004\n"
-        "Precio: 1300\n"
-        "Estado: Usado Original"
-    )
-
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        msg = update.message
-        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        folder = make_folder(ts, {"producto": "foto"})
+        await update.message.reply_text("⏳ Generando borrador SEO...")
+        seo = generate_marketplace_seo(data)
 
-        photo = msg.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        img_path = folder / "foto.jpg"
-        await file.download_to_drive(str(img_path))
+        folder = save_borrador(data, seo, foto)
 
-        try:
-            im = Image.open(img_path)
-            im.thumbnail((900, 900))
-            im.save(folder / "thumb.jpg", quality=85)
-        except Exception as e:
-            print("WARN thumb:", e)
+        # limpiar referencia temporal ya movida
+        context.user_data["foto"] = None
 
-        context.user_data["pending_folder"] = str(folder)
-        context.user_data["pending_ts"] = ts
-
-        caption = (msg.caption or "").strip()
-        pending_text = (context.user_data.get("pending_text") or "").strip()
-
-        print("FOTO OK ->", folder)
-        print("CAPTION:", repr(caption))
-        print("PENDING_TEXT:", repr(pending_text))
-
-        text_data = caption or pending_text
-        if text_data:
-            await build_and_save(update, context, folder, ts, text_data)
-            return
-
-        await msg.reply_text(
-            "✅ Foto guardada.\n\n"
-            "Ahora mandame los datos.\n"
-            "Mínimo: Producto + Precio + Estado."
+        await update.message.reply_text(
+            "✅ Borrador creado correctamente.\n\n"
+            f"Carpeta: {folder.name}"
         )
+
     except Exception as e:
-        print("ERROR FOTO:", e)
-        await update.message.reply_text(f"⚠️ Error guardando foto: {e}")
+        traceback.print_exc()
+
+        await update.message.reply_text(
+            f"⚠️ No pude crear el borrador.\nDetalle: {str(e)}"
+        )
 
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    print("ERROR GLOBAL:")
+    traceback.print_exception(context.error)
+
     try:
-        txt = (update.message.text or "").strip()
-        print("TEXTO RECIBIDO:", repr(txt))
-
-        folder_str = context.user_data.get("pending_folder")
-        ts = context.user_data.get("pending_ts")
-
-        print("PENDING:", folder_str, ts)
-
-        if not folder_str or not ts:
-            context.user_data["pending_text"] = txt
-            await update.message.reply_text(
-                "✅ Datos recibidos.\n"
-                "Ahora mandame la foto para generar el borrador."
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ Ocurrió un error inesperado procesando tu solicitud."
             )
-            return
-
-        folder = Path(folder_str)
-        await build_and_save(update, context, folder, ts, txt)
-
-    except Exception as e:
-        print("ERROR TEXTO:", e)
-        await update.message.reply_text(f"⚠️ Error procesando datos: {e}")
+    except Exception:
+        pass
 
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print("ERROR GENERAL:", context.error)
+# =========================================================
+# Main
+# =========================================================
+def main() -> None:
+    app = ApplicationBuilder().token(TG_TOKEN).build()
 
-
-def main():
-    if not TOKEN:
-        raise SystemExit("Falta TG_BOT_TOKEN")
-
-    ensure_index_file()
-
-    app = Application.builder().token(TOKEN).build()
-    app.add_error_handler(on_error)
-
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(error_handler)
 
+    print("Bot iniciado")
     app.run_polling(drop_pending_updates=True)
 
 

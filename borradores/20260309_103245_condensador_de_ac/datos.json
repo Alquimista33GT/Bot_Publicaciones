@@ -1,0 +1,14 @@
+{
+  "producto": "Condensador de A/C",
+  "marca": "Honda",
+  "linea": "Civic",
+  "anio": "2001 al 2005",
+  "precio": "250",
+  "estado": "Usado Original",
+  "motor": "D17",
+  "medida": "estándar",
+  "perfil": "",
+  "publicado": false,
+  "created_at": "2026-03-09T10:32:45",
+  "folder": "20260309_103245_condensador_de_ac"
+}
